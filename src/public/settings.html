@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="hi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dp7 — IVR Settings</title>
+<style>
+  :root{
+    --bg:#0b0d12; --card:#141821; --card2:#1b202b; --line:#252b38;
+    --txt:#e8ecf4; --dim:#8b95a8; --accent:#6c8cff; --ok:#25c07a; --warn:#f2b33d; --bad:#f1635f;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:15px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;padding:24px}
+  .wrap{max-width:860px;margin:0 auto}
+  h1{font-size:20px;margin:0 0 4px;letter-spacing:-.3px}
+  h1 span{color:var(--accent)}
+  .sub{color:var(--dim);font-size:13px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:16px}
+  .card h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--dim);
+    margin:0 0 14px;font-weight:600}
+  label{display:block;font-size:12.5px;color:var(--dim);margin-bottom:5px}
+  input{width:100%;padding:10px 12px;background:var(--card2);border:1px solid var(--line);
+    border-radius:9px;color:var(--txt);font-size:14px;font-family:inherit}
+  input:focus{outline:none;border-color:var(--accent)}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+  .row.one{grid-template-columns:1fr}
+  button{background:var(--accent);color:#fff;border:0;padding:10px 18px;border-radius:9px;
+    font-size:14px;font-weight:600;cursor:pointer;font-family:inherit}
+  button:hover{filter:brightness(1.08)}
+  button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
+  .msg{margin-top:12px;font-size:13px;padding:10px 12px;border-radius:9px;display:none}
+  .msg.ok{display:block;background:rgba(37,192,122,.12);color:var(--ok)}
+  .msg.err{display:block;background:rgba(241,99,95,.12);color:var(--bad)}
+  .hint{font-size:12px;color:var(--dim);margin-top:8px}
+  .pill{display:inline-block;font-size:11px;padding:2px 8px;border-radius:99px;
+    background:rgba(108,140,255,.15);color:var(--accent);margin-left:6px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--dim);font-weight:600;font-size:11.5px;text-transform:uppercase;
+    letter-spacing:.06em;padding:0 8px 8px 0;border-bottom:1px solid var(--line)}
+  td{padding:8px 8px 8px 0;border-bottom:1px solid rgba(37,43,56,.5)}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+  .lock{max-width:360px;margin:80px auto;text-align:center}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div id="gate" class="lock card">
+    <h1>dp7 <span>IVR</span></h1>
+    <p class="sub">Admin token daalo — ek baar, phir yaad rahega</p>
+    <input id="tokenIn" type="password" placeholder="IVR_ADMIN_TOKEN" />
+    <p><button style="width:100%;margin-top:12px" onclick="saveToken()">Kholo</button></p>
+    <div id="gateMsg" class="msg"></div>
+  </div>
+
+  <div id="app" style="display:none">
+    <h1>dp7 <span>IVR</span> <span class="pill">live settings</span></h1>
+    <p class="sub">Agent number, amount ya company naam badlo — save karte hi agli call se lagu. Redeploy ki zaroorat nahi.</p>
+
+    <div class="card">
+      <h2>Call settings</h2>
+      <div class="row">
+        <div>
+          <label>Agent ka number (transfer isi pe jaayega)</label>
+          <input id="agent_number" class="mono" placeholder="+919000000001" />
+        </div>
+        <div>
+          <label>Support number (script me bola jaata hai)</label>
+          <input id="support_number" class="mono" placeholder="9000000001" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Company naam</label>
+          <input id="company_name" />
+        </div>
+        <div>
+          <label>WhatsApp deposit link</label>
+          <input id="whatsapp_link" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Minimum deposit (₹)</label>
+          <input id="min_deposit_rupees" type="number" min="1" />
+        </div>
+        <div>
+          <label>Kitne din bina deposit pe call</label>
+          <input id="no_deposit_days" type="number" min="1" max="90" />
+        </div>
+      </div>
+      <div class="row">
+        <div>
+          <label>Max attempts</label>
+          <input id="max_attempts" type="number" min="1" max="10" />
+        </div>
+        <div>
+          <label>Call window (IST ghante)</label>
+          <div style="display:flex;gap:8px;align-items:center">
+            <input id="call_window_start" type="number" min="0" max="23" />
+            <span style="color:var(--dim)">se</span>
+            <input id="call_window_end" type="number" min="1" max="24" />
+          </div>
+        </div>
+      </div>
+      <button onclick="save()">Save karo</button>
+      <button class="ghost" onclick="load()">Reset</button>
+      <div id="msg" class="msg"></div>
+      <p class="hint">Agent number badalne ke baad ek kaam karna padega: Exotel App Bazaar me
+        <strong>Connect applet</strong> ka number bhi wahi karo — neeche copy button hai.</p>
+    </div>
+
+    <div class="card">
+      <h2>Daily deposit file upload</h2>
+      <p class="hint" style="margin:0 0 12px">
+        Roz ka Excel (ya CSV) yahan daalo. Ek username ke kai deposit ho sakte hain —
+        sabhi rows jud jaati hain, aur call <strong>sabse aakhri</strong> deposit ke 7 din baad jaati hai.
+      </p>
+      <input type="file" id="depFile" accept=".xlsx,.xls,.csv" />
+      <p style="margin-top:12px">
+        <button onclick="uploadDeposits()">Upload karo</button>
+      </p>
+      <div id="upMsg" class="msg"></div>
+      <div id="upOut" class="mono" style="margin-top:12px;color:var(--dim);white-space:pre-wrap"></div>
+    </div>
+
+    <div class="card">
+      <h2>Script preview (jo customer sunega)</h2>
+      <div class="row">
+        <div>
+          <label>Customer key</label>
+          <input id="previewKey" class="mono" placeholder="C-5001" />
+        </div>
+        <div>
+          <label>Attempt</label>
+          <input id="previewAttempt" type="number" value="1" min="1" max="3" />
+        </div>
+      </div>
+      <button class="ghost" onclick="preview()">Preview dekho</button>
+      <p id="scriptOut" class="mono" style="margin-top:14px;color:var(--dim);white-space:pre-wrap"></p>
+    </div>
+
+    <div class="card">
+      <h2>Aaj ke calls</h2>
+      <div id="jobs"></div>
+      <p class="hint" style="margin-top:12px">Ye list auto-refresh hoti hai har 30 second.</p>
+    </div>
+  </div>
+</div>
+
+<script>
+const FIELDS = ['company_name','agent_number','support_number','whatsapp_link',
+  'min_deposit_rupees','no_deposit_days','max_attempts','call_window_start','call_window_end'];
+const $ = (id) => document.getElementById(id);
+const api = (path, opts = {}) => fetch(`/api/ivr${path}`, {
+  ...opts,
+  headers: { 'Content-Type': 'application/json', 'x-admin-token': localStorage.getItem('ivrToken') || '', ...(opts.headers || {}) },
+});
+
+function saveToken(){
+  const t = $('tokenIn').value.trim();
+  if(!t) return;
+  localStorage.setItem('ivrToken', t);
+  load().catch(()=>{});
+}
+
+async function load(){
+  const msg = $('gateMsg');
+  try{
+    const res = await api('/settings');
+    if(res.status === 401){ throw new Error('token galat hai'); }
+    const data = await res.json();
+    if(!data.ok) throw new Error('settings nahi mili');
+    $('gate').style.display = 'none';
+    $('app').style.display = 'block';
+    for(const f of FIELDS) if($(f)) $(f).value = data.fields.find(x=>x.key===f)?.value ?? '';
+    loadJobs();
+  }catch(e){
+    msg.className = 'msg err';
+    msg.textContent = e.message || 'kuch galat hua';
+    localStorage.removeItem('ivrToken');
+  }
+}
+
+async function save(){
+  const body = {};
+  for(const f of FIELDS) body[f] = $(f).value.trim();
+  const res = await api('/settings', { method:'PUT', body: JSON.stringify(body) });
+  const data = await res.json();
+  const m = $('msg');
+  if(data.ok){
+    m.className = 'msg ok';
+    m.textContent = `save ho gaya — ${Object.keys(data.applied).length} setting update hue` +
+      (data.errors?.length ? ` · ${data.errors.join(', ')}` : '');
+    load();
+  } else {
+    m.className = 'msg err';
+    m.textContent = (data.errors || [data.error]).join(' · ');
+  }
+}
+
+async function uploadDeposits(){
+  const f = $('depFile').files[0];
+  const m = $('upMsg');
+  if(!f){ m.className='msg err'; m.textContent='pehle file chuno'; return; }
+
+  m.className='msg'; m.textContent='upload ho raha hai…';
+  try{
+    const res = await fetch(`/api/ivr/import-deposits?filename=${encodeURIComponent(f.name)}`, {
+      method:'POST',
+      headers:{ 'x-admin-token': localStorage.getItem('ivrToken') || '' },
+      body: f,
+    });
+    const d = await res.json();
+    if(d.ok){
+      m.className='msg ok';
+      m.textContent = `${d.imported} naye deposit · ${d.duplicate} duplicate skip · ${d.rejected} row reject · ${d.usersSeen} users`;
+      $('upOut').textContent =
+        (d.usersWithoutPhone ? `⚠ ${d.usersWithoutPhone} users ka phone nahi hai — unko call nahi ja sakti.\n` : '') +
+        (d.errors?.length ? 'Errors:\n' + d.errors.map(e=>`  line ${e.line ?? '-'}: ${e.reason}`).join('\n') : '');
+      loadJobs();
+    } else {
+      m.className='msg err';
+      m.textContent = d.reason || d.error || 'upload fail';
+    }
+  }catch(e){
+    m.className='msg err'; m.textContent = e.message;
+  }
+}
+
+async function preview(){
+  const key = $('previewKey').value.trim();
+  const attempt = $('previewAttempt').value || 1;
+  const res = await api(`/preview?customer_key=${encodeURIComponent(key)}&attempt=${attempt}`);
+  const data = await res.json();
+  $('scriptOut').textContent = data.ok ? data.text : (data.error || 'customer nahi mila');
+}
+
+async function loadJobs(){
+  try{
+    const res = await api('/jobs?limit=8');
+    const data = await res.json();
+    if(!data.jobs?.length){ $('jobs').innerHTML = '<p style="color:var(--dim);font-size:13px">abhi koi call nahi</p>'; return; }
+    const rows = data.jobs.map(j => `<tr>
+      <td class="mono">${j.customer_key}</td>
+      <td>${j.name}</td>
+      <td class="mono">${j.phone}</td>
+      <td>${j.status}${j.disposition ? ' · ' + j.disposition : ''}</td>
+      <td>${j.duration_sec ? j.duration_sec + 's' : '–'}</td>
+    </tr>`).join('');
+    $('jobs').innerHTML = `<table><thead><tr>
+      <th>Key</th><th>Naam</th><th>Phone</th><th>Status</th><th>Duration</th>
+      </tr></thead><tbody>${rows}</tbody></table>`;
+  }catch(e){ /* chup */ }
+}
+
+if(localStorage.getItem('ivrToken')) load();
+setInterval(()=>{ if($('app').style.display==='block') loadJobs(); }, 30000);
+</script>
+</body>
+</html>
+
+
+

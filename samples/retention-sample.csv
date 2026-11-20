@@ -1,0 +1,7 @@
+client_id,client_name,mobile_no,last_deposit_date,min_deposit,status,do_not_call
+C-5001,Rahul Sharma,9812345001,01/11/2026,300,ACTIVE,no
+C-5002,Priya Verma,9812345002,20/10/2026,300,ACTIVE,no
+C-5003,Amit Kumar,09812345003,18/11/2026,300,ACTIVE,no
+C-5004,Vikram Singh,9812345004,10/10/2026,300,ACTIVE,yes
+C-5005,Sneha Gupta,9812345005,01/09/2026,300,INACTIVE,no
+
