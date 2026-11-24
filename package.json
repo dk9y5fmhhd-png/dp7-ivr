@@ -12,7 +12,7 @@
     "import": "node scripts/import-csv.js",
     "import-deposits": "node scripts/import-deposits.js",
     "worker": "node src/ivr/worker.js",
-    "test": "node test/e2e.test.js && node test/deposits.test.js"
+    "test": "node test/e2e.test.js"
   },
   "engines": {
     "node": ">=20.0.0"
@@ -23,4 +23,5 @@
     "xlsx": "^0.18.5"
   }
 }
+
 

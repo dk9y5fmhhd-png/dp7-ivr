@@ -8,7 +8,9 @@ import log from '../lib/logger.js';
 import { q } from '../lib/db.js';
 import { isoWeekKey } from '../lib/cycle.js';
 import { flattenPayload, mapStatus, pick } from './exotel.js';
+import * as scripts from './script.js';
 import { buildCallScript } from './script.js';
+import { applyDigit, queueMessage } from './dtmf.js';
 import { importRetentionCsv } from '../retention/import.js';
 import { importDepositFile } from '../retention/depositImport.js';
 import { EDITABLE, getSettings, updateSettings, validateSetting } from '../settings.js';
@@ -120,16 +122,25 @@ export async function processStatusEvent(flat, rawBody) {
 
   const effectiveDigits = digits ?? job.digits;
 
-  // opt-out pehle — kuch bhi ho, DNC set hona chahiye
-  if (String(effectiveDigits ?? '') === '9') {
-    await markDnc(job);
-    await q(
-      `UPDATE call_jobs SET digits='9', disposition='opted_out', status='completed',
-              duration_sec=$2, recording_url=COALESCE($3, recording_url), updated_at=now()
-        WHERE id=$1`,
-      [job.id, duration, recording],
-    );
-    return;
+  // DTMF SIRF tab process karo jab payload me aaya ho.
+  // (job.digits me pichli call ka digit pada hota hai — use dobara
+  //  apply karna galat tha: har webhook pe wahi action dohraata tha.)
+  if (digits && String(digits).trim()) {
+    const res = await applyDigit(job, digits);
+    if (res.action !== 'none') {
+      // digit ke saath status bhi set karo — warna job 'calling' pe atki rehti
+      const finalStatus = status === 'completed' ? 'completed' : job.status;
+      await q(
+        `UPDATE call_jobs
+            SET status = $2,
+                duration_sec = COALESCE($3, duration_sec),
+                recording_url = COALESCE($4, recording_url),
+                updated_at = now()
+          WHERE id = $1`,
+        [job.id, finalStatus, duration || null, recording],
+      );
+      return;
+    }
   }
 
   if (status === 'completed') {
@@ -145,8 +156,10 @@ export async function processStatusEvent(flat, rawBody) {
     }
 
     let disposition = 'informed';
-    if (String(effectiveDigits) === '1') disposition = 'interested';
-    else if (String(effectiveDigits) === '3') disposition = 'whatsapp_sent';
+    if (String(effectiveDigits) === '1') disposition = 'link_sent';
+    else if (String(effectiveDigits) === '2') disposition = 'id_created';
+    else if (String(effectiveDigits) === '3') disposition = 'interested';
+    else if (String(effectiveDigits) === '9') disposition = 'opted_out';
 
     await q(
       `UPDATE call_jobs SET status='completed', disposition=$2, duration_sec=$3, digits=$4,
@@ -185,6 +198,8 @@ export async function processStatusEvent(flat, rawBody) {
 
 // ---------------------------------------------------------------------
 // DTMF event — applet branch se. Customer ne kaunsa button dabaya.
+// SYNC hai: applet ko turant text chahiye (Play applet ke liye), isliye
+// yahan setImmediate nahi — seedha process karke text wapas.
 // ---------------------------------------------------------------------
 router.post('/event', express.json({ limit: '64kb' }), express.urlencoded({ extended: true }), async (req, res) => {
   if (!webhookOk(req)) return res.status(403).json({ ok: false });
@@ -195,40 +210,46 @@ router.post('/event', express.json({ limit: '64kb' }), express.urlencoded({ exte
   const customField = pick(flat, 'CustomField') ?? req.query.job;
   const digits = pick(flat, 'Digits', 'digits') ?? (step.match(/^digit(\d)$/)?.[1] ?? null);
 
-  res.status(200).json({ ok: true });
-
-  setImmediate(async () => {
-    try {
-      const job = await findJob({ sid, customField });
-      if (!job) return log.warn('event.job_not_found', { sid, step });
-
-      const ins = await q(
-        `INSERT INTO call_events (provider_call_sid, job_id, kind, step, digits, payload)
-         VALUES ($1,$2,'dtmf',$3,$4,$5)
-         ON CONFLICT (provider_call_sid, kind, step) DO NOTHING
-         RETURNING id`,
-        [sid ?? job.provider_call_sid ?? '', job.id, step || 'unknown', digits, JSON.stringify(req.body ?? {})],
-      );
-      if (!ins.rows.length) return; // duplicate
-
-      if (digits) {
-        await q(`UPDATE call_jobs SET digits=$2, updated_at=now() WHERE id=$1`, [job.id, String(digits)]);
-      }
-
-      if (String(digits) === '9') {
-        await markDnc(job);
-        await q(`UPDATE call_jobs SET disposition='opted_out', updated_at=now() WHERE id=$1`, [job.id]);
-      } else if (String(digits) === '1') {
-        await q(`UPDATE call_jobs SET disposition='interested', updated_at=now() WHERE id=$1`, [job.id]);
-        log.info('lead.hot', { jobId: job.id, name: job.name, phone: job.phone });
-      } else if (String(digits) === '3') {
-        await q(`UPDATE call_jobs SET disposition='whatsapp_sent', updated_at=now() WHERE id=$1`, [job.id]);
-        // TODO: WhatsApp send yahan lagao (provider API call)
-      }
-    } catch (e) {
-      log.error('event.process_failed', { err: e.message });
+  try {
+    const job = await findJob({ sid, customField });
+    if (!job) {
+      log.warn('event.job_not_found', { sid, step, customField });
+      return res.json({ ok: true, action: 'none', say: scripts.noInputPrompt(), text: scripts.noInputPrompt() });
     }
-  });
+
+    // raw payload hamesha — debugging ka jaan
+    await q(
+      `INSERT INTO call_events (provider_call_sid, job_id, kind, step, digits, payload)
+       VALUES ($1,$2,'dtmf',$3,$4,$5)
+       ON CONFLICT (provider_call_sid, kind, step) DO NOTHING`,
+      [sid ?? job.provider_call_sid ?? '', job.id, step || String(digits ?? 'unknown'), digits, JSON.stringify(req.body ?? {})],
+    );
+
+    const s = await getSettings();
+    const base = { name: job.name, company: s.companyName, supportNumber: s.supportNumber };
+
+    if (!digits) {
+      const t = scripts.noInputPrompt();
+      return res.json({ ok: true, action: 'no_input', say: t, text: t });
+    }
+
+    const res1 = await applyDigit(job, digits);
+
+    let text = scripts.closing();
+    if (res1.action === 'send_link') text = scripts.linkSent();
+    else if (res1.action === 'new_id') text = scripts.idCreated({ newId: res1.text });
+    else if (res1.action === 'agent') text = scripts.agentTransfer();
+    else if (res1.action === 'opt_out') text = scripts.optOut(base);
+
+    log.info('event.processed', { jobId: job.id, step, digits, action: res1.action });
+
+    // Exotel ke alag-alag applet shapes ke liye teeno keys
+    return res.json({ ok: true, action: res1.action, disposition: res1.disposition, say: text, text, new_id: res1.text ?? null });
+  } catch (e) {
+    log.error('event.process_failed', { err: String(e?.message ?? e), code: e?.code, stack: e?.stack });
+    const t = 'कृपया प्रतीक्षा कीजिए।';
+    return res.status(200).json({ ok: false, action: 'error', say: t, text: t });
+  }
 });
 
 // ---------------------------------------------------------------------
@@ -294,9 +315,10 @@ router.get('/stats', requireAdmin, async (req, res) => {
        COALESCE(SUM(CASE WHEN status='no_answer' THEN 1 ELSE 0 END),0)::int AS no_answer,
        COALESCE(SUM(CASE WHEN status='busy'      THEN 1 ELSE 0 END),0)::int AS busy,
        COALESCE(SUM(CASE WHEN status='failed'    THEN 1 ELSE 0 END),0)::int AS failed,
-       COALESCE(SUM(CASE WHEN disposition='interested'    THEN 1 ELSE 0 END),0)::int AS interested,
-       COALESCE(SUM(CASE WHEN disposition='whatsapp_sent' THEN 1 ELSE 0 END),0)::int AS whatsapp_sent,
-       COALESCE(SUM(CASE WHEN disposition='opted_out'     THEN 1 ELSE 0 END),0)::int AS opted_out,
+       COALESCE(SUM(CASE WHEN disposition='link_sent'   THEN 1 ELSE 0 END),0)::int AS link_sent,
+       COALESCE(SUM(CASE WHEN disposition='id_created'  THEN 1 ELSE 0 END),0)::int AS id_created,
+       COALESCE(SUM(CASE WHEN disposition='interested'  THEN 1 ELSE 0 END),0)::int AS agent_transfer,
+       COALESCE(SUM(CASE WHEN disposition='opted_out'   THEN 1 ELSE 0 END),0)::int AS opted_out,
        COALESCE(SUM(CASE WHEN disposition='exhausted'     THEN 1 ELSE 0 END),0)::int AS exhausted,
        COALESCE(ROUND(AVG(NULLIF(duration_sec,0))),0)::int AS avg_duration
      FROM call_jobs
@@ -361,6 +383,7 @@ router.get('/settings', requireAdmin, async (_req, res) => {
       agentNumber: s.agentNumber,
       supportNumber: s.supportNumber,
       whatsappLink: s.whatsappLink,
+      websiteLink: s.websiteLink,
       minDepositRupees: s.minDepositRupees,
       noDepositDays: s.noDepositDays,
       maxAttempts: s.maxAttempts,
@@ -451,6 +474,19 @@ router.get('/uploads', requireAdmin, async (_req, res) => {
   res.json({ ok: true, uploads: rows });
 });
 
+// WhatsApp / SMS outbox — provider lagne pe bas yeh uthana hai
+router.get('/messages', requireAdmin, async (req, res) => {
+  const status = req.query.status ? String(req.query.status) : null;
+  const { rows } = await q(
+    `SELECT id, job_id, customer_key, to_phone, channel, template, status, created_at, sent_at
+       FROM ivr_messages
+      WHERE ($1::text IS NULL OR status = $1)
+      ORDER BY created_at DESC LIMIT 100`,
+    [status],
+  );
+  res.json({ ok: true, count: rows.length, messages: rows });
+});
+
 // Ek user ka deposit history — "uska last deposit kab tha" ka jawab
 router.get('/deposits', requireAdmin, async (req, res) => {
   const username = String(req.query.username ?? '').trim();
@@ -482,6 +518,15 @@ router.get('/health', async (_req, res) => {
 });
 
 export default router;
+
+
+
+
+
+
+
+
+
 
 
 

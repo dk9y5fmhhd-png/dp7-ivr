@@ -19,10 +19,11 @@ export const config = {
   dbSsl: bool(env.DB_SSL, String(env.DATABASE_URL ?? '').includes('railway')),
 
   // Tenant branding — jaisa customer ko sunai dena hai
-  companyName: env.COMPANY_NAME ?? 'Company',
+  companyName: env.COMPANY_NAME ?? 'dp7',
   supportNumber: env.SUPPORT_NUMBER ?? '',
-  agentNumber: env.AGENT_NUMBER ?? '',
+  agentNumber: env.AGENT_NUMBER ?? '+919000000001',
   whatsappLink: env.WHATSAPP_LINK ?? '',
+  websiteLink: env.WEBSITE_LINK ?? '',
 
   // Business rule
   noDepositDays: int(env.NO_DEPOSIT_DAYS, 7),
@@ -80,6 +81,7 @@ export function validateConfig({ needExotel = true, needDb = true } = {}) {
   if (config.minDepositRupees <= 0) problems.push('MIN_DEPOSIT_RUPEES must be > 0');
   return problems;
 }
-
 export default config;
+
+
 

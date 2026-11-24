@@ -11,7 +11,8 @@ export const EDITABLE = {
   company_name: { type: 'string', label: 'Company naam', max: 40 },
   agent_number: { type: 'phone', label: 'Agent ka number (transfer isi pe jaayega)', max: 16 },
   support_number: { type: 'phone', label: 'Support number (script me bola jaata hai)', max: 16 },
-  whatsapp_link: { type: 'string', label: 'WhatsApp deposit link', max: 200 },
+  whatsapp_link: { type: 'string', label: 'WhatsApp link (customer ko bhejne ke liye)', max: 200 },
+  website_link: { type: 'string', label: 'Website link (1 dabane pe SMS/WhatsApp me jaata hai)', max: 200 },
   min_deposit_rupees: { type: 'int', label: 'Minimum deposit (₹)', min: 1, max: 100000 },
   no_deposit_days: { type: 'int', label: 'Kitne din bina deposit pe call', min: 1, max: 90 },
   max_attempts: { type: 'int', label: 'Max attempts', min: 1, max: 10 },
@@ -30,6 +31,7 @@ function envDefaults() {
     agent_number: config.agentNumber || '+919000000001',
     support_number: config.supportNumber || '9000000001',
     whatsapp_link: config.whatsappLink || '',
+    website_link: config.websiteLink || '',
     min_deposit_rupees: String(config.minDepositRupees),
     no_deposit_days: String(config.noDepositDays),
     max_attempts: String(config.maxAttempts),
@@ -62,6 +64,7 @@ export async function getSettings(opts = {}) {
     agentNumber: s.agent_number,
     supportNumber: s.support_number,
     whatsappLink: s.whatsapp_link,
+    websiteLink: s.website_link,
     minDepositRupees: toInt(s.min_deposit_rupees, config.minDepositRupees),
     noDepositDays: toInt(s.no_deposit_days, config.noDepositDays),
     maxAttempts: toInt(s.max_attempts, config.maxAttempts),
@@ -145,5 +148,8 @@ export function withinCallWindow(settings, now = new Date()) {
 }
 
 export default { getSettings, getRawSettings, updateSettings, validateSetting, withinCallWindow, EDITABLE };
+
+
+
 
 

@@ -10,6 +10,7 @@ import { q, pool } from '../lib/db.js';
 import { isoWeekKey } from '../lib/cycle.js';
 import { connectCall } from './exotel.js';
 import { getSettings, withinCallWindow } from '../settings.js';
+import autoMigrate from '../lib/autoMigrate.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -278,10 +279,59 @@ export async function startWorker() {
 }
 
 const isMain = process.argv[1] && process.argv[1].endsWith('worker.js');
+
 if (isMain) {
-  startWorker().catch(async (e) => {
-    log.error('worker.crashed', { err: e.message });
-    process.exit(1);
+  // promise reject ho aur kahin catch na ho — warna process chup-chaap mar
+  // jaata hai aur log me kuch nahi aata
+  process.on('unhandledRejection', (e) => {
+    log.error('worker.unhandled', {
+      err: String(e?.message ?? e),
+      code: e?.code,
+      stack: e?.stack,
+    });
   });
+  process.on('uncaughtException', (e) => {
+    log.error('worker.uncaught', {
+      err: String(e?.message ?? e),
+      code: e?.code,
+      stack: e?.stack,
+    });
+  });
+
+  /**
+   * Boot ko crash-proof rakho:
+   *  - migrations boot pe chalao (Railway settings pe depend nahi)
+   *  - fail ho to maro mat, 20 sec ruk ke retry karo
+   *  - har failure me poora error (code + stack) log karo
+   *
+   * Isse service "running" rehti hai, console attach hota hai, aur
+   * Railway ka 1-second restart loop band ho jaata hai.
+   */
+  const boot = async () => {
+    for (let attempt = 1; attempt <= 30; attempt++) {
+      try {
+        await autoMigrate();
+        await startWorker();
+        return; // lock mila aur loop chal pada — normal exit path
+      } catch (e) {
+        log.error('worker.boot_failed', {
+          attempt,
+          err: String(e?.message ?? e),
+          code: e?.code,
+          detail: e?.detail,
+          hint: e?.hint,
+          driver: e?.driverError?.message,
+          stack: e?.stack,
+        });
+        await sleep(20000);
+      }
+    }
+    log.error('worker.gave_up', { msg: '30 attempts ke baad bhi boot nahi hua' });
+    process.exit(1);
+  };
+
+  boot();
 }
+
+
 

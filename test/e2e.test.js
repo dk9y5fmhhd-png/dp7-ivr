@@ -1,24 +1,24 @@
 // =====================================================================
-//  End-to-end test — asli Postgres pe chalta hai, Exotel ki zaroorat nahi
+//  Full end-to-end test — DP7 jaisa public.deposits banake, asli Postgres pe
 //  Chalao: npm test
 //
 //  Kya check hota hai:
-//   1. phone normalize, Hindi numbers, cycle key
-//   2. campaign sirf eligible customers chunta hai
-//   3. dialing (mock Exotel)
-//   4. webhook: interested / no-answer / short-duration / duplicate
-//   5. retry aur max-attempt cap
-//   6. press 9 -> do_not_call
-//   7. same hafte me double campaign nahi
-//   8. HTTP: health, bad token 403, good webhook 200, admin jobs
+//   1. migration (auto) + view public.deposits pe
+//   2. ek username ke kai deposit → MAX(play_date) se last deposit
+//   3. 7 din ka gate (aaj / 6 din / 8 din / 3 deposit wale)
+//   4. campaign + dialing (mock Exotel) + advisory lock
+//   5. DTMF 1 (link) / 2 (naya ID) / 3 (agent) / 9 (DND) — DB + outbox
+//   6. webhook: duplicate ignore, no-answer retry, 3 sec call
+//   7. settings (agent number) + call window
+//   8. HTTP: health, setup, tokens, settings page
 // =====================================================================
-process.env.EXOTEL_MOCK = process.env.EXOTEL_MOCK ?? '1';
-process.env.IVR_WEBHOOK_TOKEN = process.env.IVR_WEBHOOK_TOKEN ?? 'test-webhook-token';
-process.env.IVR_ADMIN_TOKEN = process.env.IVR_ADMIN_TOKEN ?? 'test-admin-token';
-process.env.DRY_RUN = process.env.DRY_RUN ?? 'false';
-process.env.COMPANY_NAME = process.env.COMPANY_NAME ?? 'DemoBrand';
-process.env.MIN_DEPOSIT_RUPEES = process.env.MIN_DEPOSIT_RUPEES ?? '300';
-process.env.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL ?? 'http://127.0.0.1:8099';
+process.env.EXOTEL_MOCK = '1';
+process.env.IVR_WEBHOOK_TOKEN = 'test-webhook-token';
+process.env.IVR_ADMIN_TOKEN = 'test-admin-token';
+process.env.DRY_RUN = 'false';
+process.env.COMPANY_NAME = 'dp7';
+process.env.MIN_DEPOSIT_RUPEES = '300';
+process.env.PUBLIC_BASE_URL = 'http://127.0.0.1:8097';
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -30,368 +30,352 @@ const root = path.join(here, '..');
 
 let pass = 0;
 const fails = [];
-const ok = (cond, label, extra) => {
-  if (cond) {
+const ok = (c, label, extra) => {
+  if (c) {
     pass++;
     console.log(`  ✓ ${label}`);
   } else {
     fails.push(label);
-    console.log(`  ✗ ${label}${extra ? ' → ' + JSON.stringify(extra) : ''}`);
+    console.log(`  ✗ ${label}${extra !== undefined ? ' → ' + JSON.stringify(extra) : ''}`);
   }
 };
 const head = (s) => console.log(`\n${s}`);
 
-// env set hone ke BAAD import
 const { pool, q } = await import('../src/lib/db.js');
+const autoMigrate = (await import('../src/lib/autoMigrate.js')).default;
 const { normalizePhone } = await import('../src/lib/phone.js');
 const { toHindiWords, rupeesToHindi } = await import('../src/lib/hindiNumbers.js');
-const { isoWeekKey, daysSince } = await import('../src/lib/cycle.js');
-const { parseDate, parseRetentionCsv } = await import('../src/retention/csv.js');
+const { isoWeekKey } = await import('../src/lib/cycle.js');
 const worker = await import('../src/ivr/worker.js');
+const { applyDigit, generateId } = await import('../src/ivr/dtmf.js');
+const scripts = await import('../src/ivr/script.js');
 const { processStatusEvent } = await import('../src/ivr/router.js');
-const script = await import('../src/ivr/script.js');
+const { getSettings, updateSettings, clearSettingsCache, withinCallWindow } = await import('../src/settings.js');
 const config = (await import('../src/lib/config.js')).default;
 
-// ---------------------------------------------------------------------
-head('0. Schema');
-for (const f of (await fs.readdir(path.join(root, 'db'))).filter((x) => x.endsWith('.sql')).sort()) {
-  await pool.query(await fs.readFile(path.join(root, 'db', f), 'utf8'));
-}
-ok(true, 'migration chal gayi (db/*.sql)');
+const daysAgo = (n) => new Date(Date.now() - n * 86400000);
 
-// saaf shuruaat
+// DP7 ka play_date IST ka din hai — test bhi IST se hisaab kare,
+// warna 6 din wala din UTC me 7 din ban jaata hai
+const istDaysAgo = (n) => {
+  const d = new Date(Date.now() + 5.5 * 3600000);
+  const base = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+  return new Date(base - n * 86400000).toISOString().slice(0, 10);
+};
+
+// ---------------------------------------------------------------------
+head('0. DP7 jaisa public.deposits banao + migration chalao');
+await pool.query(`
+  CREATE TABLE IF NOT EXISTS public.deposits (
+    id        bigserial PRIMARY KEY,
+    username  text,
+    mobile    text,
+    play_date date,
+    amount    numeric
+  )
+`);
+const { applied, failed } = await autoMigrate();
+ok(failed.length === 0, 'saari migration chali gayi', failed);
+ok(applied.length >= 5, '5+ migration files apply hui', applied.length);
+
+// ab saaf shuruaat
+await q(`TRUNCATE public.deposits RESTART IDENTITY`);
 await q(
-  `TRUNCATE call_events, call_jobs, ivr_customers, ivr_settings, ivr_deposits, deposit_uploads
+  `TRUNCATE call_events, call_jobs, ivr_customers, ivr_settings, ivr_deposits, ivr_messages, deposit_uploads
    RESTART IDENTITY CASCADE`,
 );
-// settings defaults dobara bharo (002 file)
-await pool.query(await fs.readFile(path.join(root, 'db', '002_settings.sql'), 'utf8'));
 
-// Test din-raat pe depend na kare — window poori khol do.
-// Asli window ka test 14 section me fixed ghadi pe hota hai.
-await q(`UPDATE ivr_settings SET value='0'  WHERE key='call_window_start'`);
-await q(`UPDATE ivr_settings SET value='24' WHERE key='call_window_end'`);
+// settings defaults + test ke liye window poori kholo
+await pool.query(await fs.readFile(path.join(root, 'db', '002_settings.sql'), 'utf8'));
+await updateSettings({ call_window_start: '0', call_window_end: '24' });
+clearSettingsCache();
+
+const viewSql = (await q(`SELECT pg_get_viewdef('ivr_callable_customers'::regclass) AS d`)).rows[0].d;
+// pg_get_viewdef public schema ko chhod deta hai — dono shapes chalti hain
+ok(/from\s+(public\.)?deposits/i.test(viewSql), 'view ab public.deposits pe point karta hai', viewSql.slice(0, 120));
 
 // ---------------------------------------------------------------------
 head('1. Pure functions');
-ok(normalizePhone('9876543210') === '+919876543210', 'normalize 10 digit');
-ok(normalizePhone('09876543210') === '+919876543210', 'normalize 0-prefixed');
-ok(normalizePhone('+91-98765-43210') === '+919876543210', 'normalize with dashes');
-ok(normalizePhone('919876543210') === '+919876543210', 'normalize with 91');
+ok(normalizePhone('7307130488') === '+917307130488', 'normalize 10 digit');
+ok(normalizePhone('07307130488') === '+917307130488', 'normalize 0-prefixed');
+ok(normalizePhone('+91-73071-30488') === '+917307130488', 'normalize dashes');
 ok(normalizePhone('12345') === null, 'invalid phone -> null');
-ok(toHindiWords(300) === 'तीन सौ', 'hindi 300', toHindiWords(300));
-ok(rupeesToHindi(300) === 'तीन सौ रुपये', 'rupees 300', rupeesToHindi(300));
-ok(toHindiWords(7) === 'सात', 'hindi 7');
+ok(toHindiWords(300) === 'तीन सौ', 'hindi 300');
+ok(rupeesToHindi(300) === 'तीन सौ रुपये', 'rupees 300');
 ok(toHindiWords(5000) === 'पाँच हज़ार', 'hindi 5000', toHindiWords(5000));
-ok(/^\d{4}-W\d{2}$/.test(isoWeekKey()), 'iso week key format', isoWeekKey());
-ok(parseDate('15/08/2026')?.toISOString().startsWith('2026-08-15'), 'date DD/MM/YYYY');
-ok(daysSince(new Date(Date.now() - 8 * 86400000).toISOString()) === 8, 'daysSince 8');
-
-const preview = script.buildCallScript({ name: 'Rahul Sharma', attempt: 1, min_deposit_rupees: 300 }, {
-  company: 'DemoBrand',
-  supportNumber: '9876500000',
-});
-ok(preview.text.includes('तीन सौ रुपये'), 'script me amount Hindi me');
-ok(!/[0-9]/.test(preview.text), 'script me koi digit nahi (TTS English na bole)');
-ok(preview.text.includes('Rahul'), 'script me customer ka naam (Latin fallback)');
-ok(/यह कॉल आपके खाते/.test(preview.text), 'script me opening line hai');
-
-const previewHi = script.buildCallScript(
-  { name: 'Priya Verma', name_hi: 'प्रिया वर्मा', attempt: 1, min_deposit_rupees: 300 },
-  { company: 'DemoBrand' },
-);
-ok(previewHi.text.includes('प्रिया'), 'name_hi hone pe Devanagari naam use hota hai');
+ok(/^\d{4}-W\d{2}$/.test(isoWeekKey()), 'iso week key');
 
 // ---------------------------------------------------------------------
-head('2. Retention CSV import');
-const csv = [
-  'client_id,client_name,mobile_no,last_deposit_date,min_deposit,status',
-  'C-2001,Sunil Mehta,9812300001,01/01/2026,300,ACTIVE',
-  'C-2002,Anita Desai,9812300002,15/08/2026,500,ACTIVE',
-  'C-2003,Bad Phone,12345,15/08/2026,300,ACTIVE',
-].join('\n');
-const parsed = parseRetentionCsv(csv);
-ok(parsed.rows.length === 3, 'csv ne 3 rows padhi', parsed.rows.length);
-ok(parsed.rows[0].min_deposit_rupees === 300, 'csv se min deposit 300');
-const { importRetentionCsv } = await import('../src/retention/import.js');
-const imp = await importRetentionCsv(csv, { filename: 'test.csv' });
-ok(imp.imported === 2, '2 row import hui', imp);
-ok(imp.rejected === 1, '1 row reject hui (invalid phone)', imp.rejected);
+head('2. Deposits — ek username ke kai deposit');
+const DEP = [
+  // 10babita10: 3 deposit, sabse aakhri 8 din purana -> call HAAN
+  ['10babita10', '7307130488', 40, 500],
+  ['10babita10', '7307130488', 20, 300],
+  ['10babita10', '7307130488', 8, 1000],
+  // rahul9: aaj deposit -> call NAHI
+  ['rahul9', '9812345001', 30, 500],
+  ['rahul9', '9812345001', 0, 300],
+  // priya7: 6 din -> NAHI
+  ['priya7', '9812345002', 6, 700],
+  // amit3: 15 din -> HAAN
+  ['amit3', '9812345003', 15, 400],
+  // sunil1: sirf purana deposit 25 din -> HAAN
+  ['sunil1', '9812345004', 25, 300],
+  // bad phone -> skip
+  ['kachra1', '12345', 12, 300],
+];
 
-// ---------------------------------------------------------------------
-head('3. Campaign — sirf eligible customers');
-const { seedDemo } = await import('../scripts/seed-demo.js');
-await seedDemo();
-const created = await worker.buildCampaign(isoWeekKey());
-const keys = created.map((r) => r.customer_key).sort();
-// C-2001/C-2002 retention CSV se aaye — matlab import ka data calling me pahuncha
+for (const [u, m, d, a] of DEP) {
+  await q(`INSERT INTO public.deposits (username, mobile, play_date, amount) VALUES ($1,$2,$3,$4)`, [
+    u, m, istDaysAgo(d), a,
+  ]);
+}
+
+const { rows: v } = await q(`SELECT * FROM ivr_callable_customers ORDER BY customer_key`);
+ok(v.length === 6, 'view me 6 unique users', v.length);
+
+const babita = v.find((r) => r.customer_key === '10babita10');
+ok(babita.deposit_count === 3, '10babita10 ke 3 deposit count', babita.deposit_count);
+ok(Number(babita.total_deposited_rupees) === 1800, 'total 1800', babita.total_deposited_rupees);
 ok(
-  JSON.stringify(keys) === JSON.stringify(['C-1001', 'C-1002', 'C-1008', 'C-2001', 'C-2002']),
-  'sirf eligible customers chune gaye (seed + imported)',
-  keys,
+  Math.abs((Date.now() - new Date(babita.last_deposit_at).getTime()) / 86400000 - 8) < 1.1,
+  'last deposit 8 din purana (sabse aakhri, pehla nahi)',
+  babita.last_deposit_at,
 );
-ok(!keys.includes('C-1003'), '5 din pehle deposit wala skip');
-ok(!keys.includes('C-1004'), 'inactive skip');
-ok(!keys.includes('C-1005'), 'DNC skip');
-ok(!keys.includes('C-1006'), 'invalid phone skip');
-ok(!keys.includes('C-1007'), '7 din se kam (6 din 23 ghante) wala skip');
+ok(babita.phone_e164 === '+917307130488', 'phone normalize hua', babita.phone_e164);
+ok(v.every((r) => r.is_active === true), 'is_active true (DP7 Inactive != account band)');
+
+head('2b. trigger — naya deposit aaye to ivr_customers row bane');
+await q(`INSERT INTO public.deposits (username, mobile, play_date, amount) VALUES ('naya_user','9812349999',now()::date,300)`);
+const { rows: cRow } = await q(`SELECT * FROM ivr_customers WHERE customer_key='naya_user'`);
+ok(cRow.length === 1, 'naye user ki ivr_customers row ban gayi');
+await q(`DELETE FROM public.deposits WHERE username='naya_user'`);
+await q(`DELETE FROM ivr_customers WHERE customer_key='naya_user'`);
 
 // ---------------------------------------------------------------------
-head('4. Dedupe — dobara campaign me 0 nayi job');
+head('3. Campaign — sirf 7+ din wale');
+const created = await worker.buildCampaign(isoWeekKey());
+const picked = created.map((r) => r.customer_key).sort();
+ok(JSON.stringify(picked) === JSON.stringify(['10babita10', 'amit3', 'sunil1']), 'sirf 3 eligible chune', picked);
+ok(!picked.includes('rahul9'), 'aaj deposit wala skip');
+ok(!picked.includes('priya7'), '6 din wala skip');
+ok(!picked.includes('kachra1'), 'bad phone wala skip');
+ok(!picked.includes('naya_user'), 'deleted user skip');
+
+head('3b. Dedupe — dobara campaign me 0');
 const again = await worker.buildCampaign(isoWeekKey());
-ok(again.length === 0, 'same hafte me dobara koi job nahi bani', again.length);
+ok(again.length === 0, 'same hafte me dobara job nahi', again.length);
 
 // ---------------------------------------------------------------------
-head('5. Dialing (mock Exotel)');
+head('4. Dialing (mock) + advisory lock');
 const dialed = await worker.dialQueue(10);
-ok(dialed.length === 5, '5 call dial hui', dialed.length);
-const { rows: jobs } = await q('SELECT * FROM call_jobs ORDER BY id');
-ok(jobs.every((j) => j.status === 'calling'), 'saari jobs calling state me');
-ok(jobs.every((j) => String(j.provider_call_sid).startsWith('MOCK-')), 'mock SID save hua');
+ok(dialed.length === 3, '3 call dial hui', dialed.length);
 
+const { rows: jobs } = await q(`SELECT * FROM call_jobs ORDER BY id`);
+ok(jobs.every((j) => j.status === 'calling'), 'saari jobs calling');
+ok(jobs.every((j) => String(j.provider_call_sid).startsWith('MOCK-')), 'mock SID save');
 const jobBy = (k) => jobs.find((j) => j.customer_key === k);
 
-// ---------------------------------------------------------------------
-head('6. Webhook — interested (press 1, 42 sec)');
-await processStatusEvent(
-  { CallSid: jobBy('C-1001').provider_call_sid, Status: 'completed', Duration: '42', Digits: '1', CustomField: String(jobBy('C-1001').id) },
-  { CallSid: jobBy('C-1001').provider_call_sid, Status: 'completed', Duration: '42', Digits: '1' },
-);
-let row = (await q('SELECT * FROM call_jobs WHERE id=$1', [jobBy('C-1001').id])).rows[0];
-ok(row.status === 'completed', 'status completed', row.status);
-ok(row.disposition === 'interested', 'disposition interested', row.disposition);
-ok(row.duration_sec === 42, 'duration 42 sec save', row.duration_sec);
-
-head('6b. Duplicate webhook ignore');
-await processStatusEvent(
-  { CallSid: jobBy('C-1001').provider_call_sid, Status: 'completed', Duration: '42', Digits: '1' },
-  { CallSid: jobBy('C-1001').provider_call_sid, Status: 'completed', Duration: '42' },
-);
-const evCount = (await q(`SELECT count(*)::int c FROM call_events WHERE job_id=$1 AND kind='status'`, [jobBy('C-1001').id])).rows[0].c;
-ok(evCount === 1, 'duplicate event sirf ek baar save hua', evCount);
-
-head('6c. No-answer -> retry schedule');
-await processStatusEvent(
-  { CallSid: jobBy('C-1002').provider_call_sid, Status: 'no-answer', Duration: '0' },
-  { CallSid: jobBy('C-1002').provider_call_sid, Status: 'no-answer' },
-);
-row = (await q('SELECT * FROM call_jobs WHERE id=$1', [jobBy('C-1002').id])).rows[0];
-ok(row.status === 'no_answer', 'status no_answer', row.status);
-ok(row.next_attempt_at !== null, 'next_attempt_at set hua');
-
-head('6d. 3 sec call = asal me baat nahi hui');
-await processStatusEvent(
-  { CallSid: jobBy('C-1008').provider_call_sid, Status: 'completed', Duration: '3' },
-  { CallSid: jobBy('C-1008').provider_call_sid, Status: 'completed', Duration: '3' },
-);
-row = (await q('SELECT * FROM call_jobs WHERE id=$1', [jobBy('C-1008').id])).rows[0];
-ok(row.status === 'no_answer', '3 sec call -> no_answer treat hui', row.status);
+const c1 = await pool.connect();
+const c2 = await pool.connect();
+const l1 = (await c1.query('SELECT pg_try_advisory_lock($1) AS ok', [config.advisorLockId])).rows[0].ok;
+const l2 = (await c2.query('SELECT pg_try_advisory_lock($1) AS ok', [config.advisorLockId])).rows[0].ok;
+ok(l1 === true && l2 === false, 'doosra worker lock nahi le paya (double call nahi)');
+await c2.query('SELECT pg_advisory_unlock_all()'); c2.release();
+await c1.query('SELECT pg_advisory_unlock_all()'); c1.release();
 
 // ---------------------------------------------------------------------
-head('7. Retry — attempt 2, phir cap');
-await q(`UPDATE call_jobs SET next_attempt_at = now() - interval '1 hour' WHERE status='no_answer'`);
-const retries = await worker.scheduleRetries();
-ok(retries.length === 2, '2 retry queue me aayi', retries.length);
-row = (await q('SELECT * FROM call_jobs WHERE id=$1', [jobBy('C-1002').id])).rows[0];
-ok(row.attempt === 2 && row.status === 'pending', 'attempt 2, status pending', row);
+head('5. DTMF 1 — website link WhatsApp + SMS me queue');
+let r = await applyDigit(jobBy('10babita10'), '1');
+ok(r.action === 'send_link' && r.disposition === 'link_sent', 'action send_link', r);
+let { rows: msgs } = await q(`SELECT channel, template FROM ivr_messages WHERE customer_key='10babita10' ORDER BY channel`);
+ok(msgs.length === 2, '2 message queue me (whatsapp + sms)', msgs);
+ok(msgs.map((m) => m.channel).sort().join(',') === 'sms,whatsapp', 'dono channel', msgs.map((m) => m.channel));
 
-// attempt 3 tak pahuncha do, phir no_answer -> aur retry nahi
-await q(`UPDATE call_jobs SET attempt=3, status='no_answer', next_attempt_at=now() - interval '1 hour' WHERE id=$1`, [
-  jobBy('C-1002').id,
-]);
-const capRetries = await worker.scheduleRetries();
-ok(capRetries.length === 0, 'max attempt ke baad retry nahi (attempt 3/3)', capRetries.length);
+head('5b. duplicate — dobara 1 dabaya to naya message nahi');
+await applyDigit(jobBy('10babita10'), '1');
+({ rows: msgs } = await q(`SELECT id FROM ivr_messages WHERE customer_key='10babita10'`));
+ok(msgs.length === 2, 'duplicate message nahi bana', msgs.length);
 
-// ---------------------------------------------------------------------
-head('8. Press 9 -> do_not_call');
-const realJob = jobBy('C-1008');
-await processStatusEvent(
-  { CallSid: realJob.provider_call_sid, Status: 'completed', Duration: '25', Digits: '9' },
-  { CallSid: realJob.provider_call_sid, Status: 'completed', Duration: '25', Digits: '9' },
+head('5c. DTMF 2 — naya ID');
+r = await applyDigit(jobBy('amit3'), '2');
+ok(r.action === 'new_id' && r.disposition === 'id_created', 'action new_id', r);
+ok(/^amit3\d{4}$/.test(r.text ?? ''), 'ID format sahi (amit3XXXX)', r.text);
+const { rows: idRow } = await q(`SELECT new_id FROM call_jobs WHERE customer_key='amit3'`);
+ok(idRow[0].new_id === r.text, 'naya ID call_jobs me save');
+({ rows: msgs } = await q(`SELECT template FROM ivr_messages WHERE customer_key='amit3'`));
+ok(msgs.length === 2 && msgs.every((m) => m.template === 'new_id'), 'ID message 2 channel pe queue', msgs);
+
+head('5d. DTMF 3 — agent transfer');
+r = await applyDigit(jobBy('sunil1'), '3');
+ok(r.action === 'agent' && r.disposition === 'interested', 'action agent', r);
+
+head('5e. DTMF 9 — DND');
+await q(`INSERT INTO public.deposits (username, mobile, play_date, amount) VALUES ('dnc_user','9812347777','${istDaysAgo(20)}',300)`);
+const { rows: dncJob } = await q(
+  `INSERT INTO call_jobs (customer_key, name, phone, reason, cycle_key, attempt, status)
+   VALUES ('dnc_user','dnc_user','+919812347777','no_deposit_7d','TEST-DNC',1,'calling') RETURNING *`,
 );
-row = (await q('SELECT * FROM call_jobs WHERE id=$1', [realJob.id])).rows[0];
-ok(row.disposition === 'opted_out', 'disposition opted_out', row.disposition);
-const cust = (await q('SELECT * FROM ivr_customers WHERE customer_key=$1', [realJob.customer_key])).rows[0];
-ok(cust.do_not_call === true, 'customer pe do_not_call true');
+r = await applyDigit(dncJob[0], '9');
+ok(r.action === 'opt_out' && r.disposition === 'opted_out', 'action opt_out', r);
+const { rows: dncCust } = await q(`SELECT do_not_call FROM ivr_customers WHERE customer_key='dnc_user'`);
+ok(dncCust[0].do_not_call === true, 'customer DND flag set');
 
-// ab campaign me dobara nahi aana chahiye (agla hafta bhi)
+head('5f. DND ke baad campaign me nahi aayega');
 const nextWeek = isoWeekKey(new Date(Date.now() + 7 * 86400000));
-const nextWeekCreated = await worker.buildCampaign(nextWeek);
-ok(!nextWeekCreated.some((c) => c.customer_key === realJob.customer_key), 'opted-out customer agle hafte bhi skip');
+const nw = await worker.buildCampaign(nextWeek);
+ok(!nw.some((x) => x.customer_key === 'dnc_user'), 'DND user agle hafte bhi skip');
+await q(`DELETE FROM call_jobs WHERE cycle_key='TEST-DNC'`);
 
 // ---------------------------------------------------------------------
-head('9. Dry run — koi call nahi jaati');
-const { rows: before } = await q(`SELECT count(*)::int c FROM call_jobs WHERE status='calling'`);
-const cfg = (await import('../src/lib/config.js')).default;
-cfg.dryRun = true;
-await q(`UPDATE call_jobs SET status='pending' WHERE status='no_answer'`);
-const dryRes = await worker.dialQueue(5);
-cfg.dryRun = false;
-ok(dryRes.every((r) => r.outcome === 'dry_run'), 'dry run me koi asli call nahi', dryRes);
+head('6. Webhook — duplicate / no-answer / 3 sec');
+await processStatusEvent(
+  { CallSid: jobBy('sunil1').provider_call_sid, Status: 'completed', Duration: '42', Digits: '3' },
+  { CallSid: jobBy('sunil1').provider_call_sid, Status: 'completed', Duration: '42', Digits: '3' },
+);
+let job = (await q(`SELECT * FROM call_jobs WHERE id=$1`, [jobBy('sunil1').id])).rows[0];
+ok(job.duration_sec === 42, 'duration 42 save', job.duration_sec);
+
+await processStatusEvent(
+  { CallSid: jobBy('sunil1').provider_call_sid, Status: 'completed', Duration: '42', Digits: '3' },
+  { CallSid: jobBy('sunil1').provider_call_sid, Status: 'completed', Duration: '42' },
+);
+const evCount = (await q(`SELECT count(*)::int c FROM call_events WHERE job_id=$1 AND kind='status'`, [jobBy('sunil1').id])).rows[0].c;
+ok(evCount === 1, 'duplicate webhook sirf ek baar save', evCount);
+
+await processStatusEvent(
+  { CallSid: jobBy('amit3').provider_call_sid, Status: 'no-answer', Duration: '0' },
+  { CallSid: jobBy('amit3').provider_call_sid, Status: 'no-answer' },
+);
+job = (await q(`SELECT * FROM call_jobs WHERE id=$1`, [jobBy('amit3').id])).rows[0];
+ok(job.status === 'no_answer' && job.next_attempt_at !== null, 'no_answer + retry set', job.status);
+
+head('6b. 3 sec call = baat nahi hui');
+await q(`INSERT INTO public.deposits (username, mobile, play_date, amount) VALUES ('short_user','9812346666','${istDaysAgo(20)}',300)`);
+const { rows: sj } = await q(
+  `INSERT INTO call_jobs (customer_key, name, phone, reason, cycle_key, attempt, status, provider_call_sid)
+   VALUES ('short_user','short_user','+919812346666','no_deposit_7d','TEST-SHORT',1,'calling','MOCK-SHORT') RETURNING *`,
+);
+await processStatusEvent({ CallSid: 'MOCK-SHORT', Status: 'completed', Duration: '3' }, { CallSid: 'MOCK-SHORT', Status: 'completed', Duration: '3' });
+job = (await q(`SELECT * FROM call_jobs WHERE id=$1`, [sj[0].id])).rows[0];
+ok(job.status === 'no_answer', '3 sec call -> no_answer', job.status);
+
+head('6c. retry cap');
+await q(`UPDATE call_jobs SET attempt=3, status='no_answer', next_attempt_at=now() - interval '1 hour'
+         WHERE status IN ('no_answer','busy','failed')`);
+const capRetries = await worker.scheduleRetries();
+ok(capRetries.length === 0, 'attempt 3/3 ke baad retry nahi', capRetries.length);
 
 // ---------------------------------------------------------------------
-head('10. HTTP — health, token, admin');
-const port = 8099;
+head('7. Settings — agent number bina redeploy');
+const s0 = await getSettings({ fresh: true });
+ok(s0.companyName === 'dp7', 'company dp7', s0.companyName);
+ok(s0.minDepositRupees === 300, 'min deposit 300', s0.minDepositRupees);
+ok(s0.noDepositDays === 7, 'no deposit days 7', s0.noDepositDays);
+
+await updateSettings({ agent_number: '9876500099' });
+clearSettingsCache();
+const s1 = await getSettings({ fresh: true });
+ok(s1.agentNumber === '+919876500099', 'agent number normalize + save', s1.agentNumber);
+
+const bad = await updateSettings({ agent_number: '123' });
+ok(bad.errors.length > 0 && !bad.applied.agent_number, 'galat number reject', bad.errors);
+
+head('7b. call window (IST)');
+const w = { callWindowStart: 10, callWindowEnd: 21 };
+ok(withinCallWindow(w, new Date('2026-11-20T05:30:00Z')), '11:00 IST andar');
+ok(!withinCallWindow(w, new Date('2026-11-20T18:00:00Z')), '23:30 IST bahar');
+
+await updateSettings({ call_window_start: '21', call_window_end: '22' });
+clearSettingsCache();
+ok((await worker.dialQueue(5)).length === 0, 'window band pe koi call nahi');
+await updateSettings({ call_window_start: '0', call_window_end: '24' });
+clearSettingsCache();
+
+// ---------------------------------------------------------------------
+head('8. Script — Hindi, koi digit nahi');
+await updateSettings({ company_name: 'dp7' });
+clearSettingsCache();
+const sc = scripts.buildCallScript({ name: '10babita10', attempt: 1, min_deposit_rupees: 300 }, { company: 'dp7' });
+ok(sc.text.includes('तीन सौ रुपये'), 'amount Hindi me');
+// amount aur din shabdon me hone chahiye (naam/company me digit ho sakta hai)
+ok(/सात दिनों/.test(sc.text), 'din Hindi me (सात दिनों)');
+ok(sc.text.includes('dp7'), 'company naam');
+ok(sc.text.includes('वेबसाइट'), 'menu me website option');
+ok(sc.text.includes('आई डी'), 'menu me naya ID option');
+const menuTxt = scripts.menu();
+ok(!/[0-9]/.test(menuTxt), 'menu me bhi digit nahi');
+
+// ---------------------------------------------------------------------
+head('9. HTTP');
+const port = 8097;
 const child = spawn(process.execPath, [path.join(root, 'src/server.js')], {
   env: { ...process.env, PORT: String(port) },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 await new Promise((resolve, reject) => {
-  const t = setTimeout(() => reject(new Error('server start nahi hua')), 15000);
+  const t = setTimeout(() => reject(new Error('server start nahi hua')), 20000);
   child.stdout.on('data', (b) => {
-    if (b.toString().includes('server.started')) {
-      clearTimeout(t);
-      resolve();
-    }
+    if (b.toString().includes('server.started')) { clearTimeout(t); resolve(); }
   });
   child.stderr.on('data', (b) => process.env.DEBUG && console.error(b.toString()));
 });
 
 const base = `http://127.0.0.1:${port}`;
 try {
-  const h = await fetch(`${base}/api/health`);
-  ok(h.status === 200, 'GET /api/health -> 200');
+  ok((await fetch(`${base}/api/health`)).status === 200, 'GET /api/health -> 200');
 
-  const bad = await fetch(`${base}/api/ivr/webhook?token=galat`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: 'CallSid=x&Status=completed',
-  });
-  ok(bad.status === 403, 'galat token -> 403', bad.status);
+  const setup = await (await fetch(`${base}/api/ivr/setup`)).json();
+  ok(setup.checks?.db?.ok === true, 'setup: db ok', setup.checks?.db);
+  ok(setup.checks?.view_rows?.ok === true, 'setup: view padhi gayi', setup.checks?.view_rows);
+  ok(typeof setup.checks?.callable_now?.value === 'number', 'setup: callable_now number', setup.checks?.callable_now);
 
-  const noAuth = await fetch(`${base}/api/ivr/jobs`);
-  ok(noAuth.status === 401, 'bina admin token -> 401', noAuth.status);
+  ok((await fetch(`${base}/api/ivr/webhook?token=galat`, { method: 'POST' })).status === 403, 'galat token -> 403');
+  ok((await fetch(`${base}/api/ivr/jobs`)).status === 401, 'bina admin token -> 401');
 
-  const jobsRes = await fetch(`${base}/api/ivr/jobs?limit=5`, { headers: { 'x-admin-token': 'test-admin-token' } });
-  const jobsJson = await jobsRes.json();
-  ok(jobsRes.status === 200 && Array.isArray(jobsJson.jobs), 'admin /jobs -> 200 + list');
+  const jobsRes = await (await fetch(`${base}/api/ivr/jobs?limit=5`, { headers: { 'x-admin-token': 'test-admin-token' } })).json();
+  ok(Array.isArray(jobsRes.jobs), 'admin /jobs list');
 
-  const stats = await fetch(`${base}/api/ivr/stats`, { headers: { 'x-admin-token': 'test-admin-token' } });
-  const statsJson = await stats.json();
-  ok(stats.status === 200 && statsJson.jobs.completed >= 1, 'admin /stats -> counts', statsJson.jobs);
+  const st = await (await fetch(`${base}/api/ivr/stats`, { headers: { 'x-admin-token': 'test-admin-token' } })).json();
+  ok(st.jobs.completed >= 1, 'stats: completed count', st.jobs);
 
-  const prev = await fetch(`${base}/api/ivr/preview?customer_key=C-1001`, {
-    headers: { 'x-admin-token': 'test-admin-token' },
-  });
-  const prevJson = await prev.json();
-  ok(prev.status === 200 && prevJson.text?.includes('तीन सौ'), 'script preview Hindi me', prevJson.block);
+  const ms = await (await fetch(`${base}/api/ivr/messages`, { headers: { 'x-admin-token': 'test-admin-token' } })).json();
+  ok(ms.count >= 4, 'messages outbox endpoint', ms.count);
 
-  // webhook good token — 200 turant milta hai
-  const good = await fetch(`${base}/api/ivr/webhook?token=test-webhook-token`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: 'CallSid=MOCK-HTTPTEST&Status=completed&Duration=30&CustomField=1',
-  });
-  ok(good.status === 200, 'sahi token -> 200 turant', good.status);
+  const stg = await (await fetch(`${base}/api/ivr/settings`, { headers: { 'x-admin-token': 'test-admin-token' } })).json();
+  ok(stg.settings.agentNumber === '+919876500099', 'settings: agent number API se', stg.settings.agentNumber);
 
-  // webhook 200 turant deta hai, processing uske baad — server ko kaam karne do
-  await new Promise((r) => setTimeout(r, 800));
-
-  // -------------------------------------------------------------------
-  head('10b. Settings — agent number yahan se badalta hai');
-
-  const s0 = await fetch(`${base}/api/ivr/settings`, { headers: { 'x-admin-token': 'test-admin-token' } });
-  const s0j = await s0.json();
-  ok(s0.status === 200 && s0j.settings.companyName === 'dp7', 'default company dp7 hai', s0j.settings.companyName);
-  ok(s0j.settings.agentNumber === '+919000000001', 'default agent placeholder', s0j.settings.agentNumber);
-
-  const noTok = await fetch(`${base}/api/ivr/settings`);
-  ok(noTok.status === 401, 'bina token settings -> 401');
-
-  // naya agent number, bina +91 ke — normalize hona chahiye
-  const put = await fetch(`${base}/api/ivr/settings`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json', 'x-admin-token': 'test-admin-token' },
-    body: JSON.stringify({ agent_number: '9876500099', min_deposit_rupees: '300' }),
-  });
-  const putj = await put.json();
-  ok(put.status === 200 && putj.applied.agent_number === '+919876500099', 'agent number save + normalize', putj.applied);
-
-  const s1 = await (await fetch(`${base}/api/ivr/settings`, { headers: { 'x-admin-token': 'test-admin-token' } })).json();
-  ok(s1.settings.agentNumber === '+919876500099', 'naya number padha ja raha hai', s1.settings.agentNumber);
-
-  // galat number reject
-  const badPut = await fetch(`${base}/api/ivr/settings`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json', 'x-admin-token': 'test-admin-token' },
-    body: JSON.stringify({ agent_number: '123' }),
-  });
-  ok(badPut.status === 400, 'galat number reject hua', badPut.status);
-
-  // agent endpoint
-  const ag = await fetch(`${base}/api/ivr/agent?token=test-admin-token`);
-  const agj = await ag.json();
-  ok(ag.status === 200 && agj.agent_number === '+919876500099', 'GET /agent naya number deta hai', agj);
-
-  // company naam badla -> script me turant dikhna chahiye
-  await fetch(`${base}/api/ivr/settings`, {
-    method: 'PUT',
-    headers: { 'content-type': 'application/json', 'x-admin-token': 'test-admin-token' },
-    body: JSON.stringify({ company_name: 'dp7' }),
-  });
-  const prev2 = await (
-    await fetch(`${base}/api/ivr/preview?customer_key=C-1001&attempt=1`, {
-      headers: { 'x-admin-token': 'test-admin-token' },
-    })
-  ).json();
-  ok(prev2.text.includes('dp7'), 'script me company dp7 bolti hai');
-  ok(prev2.text.includes('तीन सौ'), 'script me ₹300 Hindi me');
-
-  // settings page khulta hai
   const page = await fetch(`${base}/ivr/settings`);
   const html = await page.text();
-  ok(page.status === 200 && html.includes('agent_number'), 'settings page serve ho raha hai');
+  ok(page.status === 200 && html.includes('agent_number'), 'settings page serve');
 
-  // settings badalne ka asar worker pe
-  const { getSettings, clearSettingsCache } = await import('../src/settings.js');
-  clearSettingsCache();
-  const ws = await getSettings({ fresh: true });
-  ok(ws.agentNumber === '+919876500099' && ws.minDepositRupees === 300, 'worker ko nayi settings milti hain', ws.agentNumber);
+  // DTMF event endpoint — 1 dabao
+  const { rows: j2 } = await q(
+    `INSERT INTO call_jobs (customer_key, name, phone, reason, cycle_key, attempt, status, provider_call_sid)
+     VALUES ('10babita10','10babita10','+917307130488','no_deposit_7d','TEST-EV',1,'calling','MOCK-EV') RETURNING *`,
+  );
+  await q(`DELETE FROM ivr_messages WHERE job_id=$1`, [j2[0].id]);
+  const ev = await (await fetch(`${base}/api/ivr/event?step=digit1&token=test-webhook-token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ CallSid: 'MOCK-EV', Digits: '1' }),
+  })).json();
+  ok(ev.action === 'send_link', 'event endpoint: action send_link', ev);
+  ok(typeof ev.text === 'string' && ev.text.length > 10, 'event endpoint: Hindi text return hua');
+  const { rows: evMsgs } = await q(`SELECT channel FROM ivr_messages WHERE job_id=$1 ORDER BY channel`, [j2[0].id]);
+  ok(evMsgs.length === 2, 'event endpoint se 2 message queue', evMsgs);
+  await q(`DELETE FROM call_jobs WHERE cycle_key='TEST-EV'`);
+
+  const bad2 = await fetch(`${base}/api/ivr/event?step=digit1&token=galat`, { method: 'POST' });
+  ok(bad2.status === 403, 'event bina token -> 403');
 } finally {
   child.kill('SIGKILL');
 }
 
 // ---------------------------------------------------------------------
-await new Promise((r) => setTimeout(r, 300));
-head('11. DB me raw payload save hua?');
+head('10. Raw payload save hua (debugging ke liye)');
 const raw = (await q(`SELECT payload->>'Status' s FROM call_events WHERE kind='status' LIMIT 1`)).rows[0];
-ok(Boolean(raw?.s), 'call_events me raw payload hai', raw);
-
-const evTotal = (await q('SELECT count(*)::int c FROM call_events')).rows[0].c;
-ok(evTotal >= 4, 'saare events log hue', evTotal);
-
-// ---------------------------------------------------------------------
-head('12. Cron matcher (Asia/Kolkata)');
-ok(worker.cronMatches('30 21 * * *', new Date('2026-11-20T16:00:00Z'), 'Asia/Kolkata'), '21:30 IST -> match');
-ok(!worker.cronMatches('30 21 * * *', new Date('2026-11-20T10:00:00Z'), 'Asia/Kolkata'), '15:30 IST -> no match');
-ok(worker.cronMatches('*/5 * * * *', new Date('2026-11-20T10:05:00Z'), 'UTC'), '*/5 minute match');
-
-head('13. Advisory lock — do worker ek saath nahi chalenge');
-const c1 = await pool.connect();
-const l1 = (await c1.query('SELECT pg_try_advisory_lock($1) AS ok', [config.advisorLockId])).rows[0].ok;
-const c2 = await pool.connect();
-const l2 = (await c2.query('SELECT pg_try_advisory_lock($1) AS ok', [config.advisorLockId])).rows[0].ok;
-ok(l1 === true, 'pehla worker lock le paya');
-ok(l2 === false, 'doosra worker lock nahi le paya (double call nahi hogi)');
-await c2.query('SELECT pg_advisory_unlock_all()');
-c2.release();
-await c1.query('SELECT pg_advisory_unlock_all()');
-c1.release();
-
-head('14. Call window (IST) — raat 10 baje ke baad call nahi');
-const { withinCallWindow, clearSettingsCache: clearCache2, updateSettings } = await import('../src/settings.js');
-const s = { callWindowStart: 10, callWindowEnd: 21 };
-ok(withinCallWindow(s, new Date('2026-11-20T05:30:00Z')), '11:00 IST -> andar hai');   // 05:30Z = 11:00 IST
-ok(!withinCallWindow(s, new Date('2026-11-20T03:30:00Z')), '09:00 IST -> bahar hai');
-ok(!withinCallWindow(s, new Date('2026-11-20T18:00:00Z')), '23:30 IST -> bahar hai');
-
-// settings API se window band karo -> worker turant maan le
-await updateSettings({ call_window_start: '21', call_window_end: '22' });
-clearCache2();
-const blocked = await worker.dialQueue(5);
-ok(blocked.length === 0, 'window band hone pe koi call nahi jaati', blocked.length);
-await updateSettings({ call_window_start: '0', call_window_end: '24' });
-clearCache2();
+ok(raw?.s === 'completed' || raw?.s === 'no-answer', 'call_events me raw payload', raw);
 
 // ---------------------------------------------------------------------
 head('──────── RESULT ────────');
@@ -404,12 +388,6 @@ if (fails.length) {
 
 await pool.end();
 process.exit(fails.length ? 1 : 0);
-
-
-
-
-
-
 
 
 

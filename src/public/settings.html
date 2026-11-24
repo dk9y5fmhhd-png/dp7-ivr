@@ -70,16 +70,26 @@
           <input id="support_number" class="mono" placeholder="9000000001" />
         </div>
       </div>
-      <div class="row">
+      <div class="row one">
         <div>
-          <label>Company naam</label>
+          <label>Company naam (script me bolta hai)</label>
           <input id="company_name" />
         </div>
+      </div>
+      <div class="row">
         <div>
-          <label>WhatsApp deposit link</label>
-          <input id="whatsapp_link" />
+          <label>Website link (1 dabane pe SMS + WhatsApp me jaata hai)</label>
+          <input id="website_link" placeholder="https://dailyplay7.com" />
+        </div>
+        <div>
+          <label>WhatsApp link</label>
+          <input id="whatsapp_link" placeholder="https://wa.me/91..." />
         </div>
       </div>
+      <p class="hint" style="margin:-4px 0 14px">
+        IVR keys: <strong>1</strong> = link bhejo · <strong>2</strong> = naya ID banao ·
+        <strong>3</strong> = agent se baat · <strong>9</strong> = call band (DND)
+      </p>
       <div class="row">
         <div>
           <label>Minimum deposit (₹)</label>
@@ -150,7 +160,7 @@
 </div>
 
 <script>
-const FIELDS = ['company_name','agent_number','support_number','whatsapp_link',
+const FIELDS = ['company_name','agent_number','support_number','website_link','whatsapp_link',
   'min_deposit_rupees','no_deposit_days','max_attempts','call_window_start','call_window_end'];
 const $ = (id) => document.getElementById(id);
 const api = (path, opts = {}) => fetch(`/api/ivr${path}`, {
@@ -260,6 +270,9 @@ setInterval(()=>{ if($('app').style.display==='block') loadJobs(); }, 30000);
 </script>
 </body>
 </html>
+
+
+
 
 
 
